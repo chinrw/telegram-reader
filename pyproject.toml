@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-reader"
+version = "0.1.0"
+description = "MCP server that lets an LLM agent read your Telegram channels and groups and download their files, named after the post"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "mcp>=1.29,<2",
+  "python-socks>=2.4",
+  "telethon>=1.45",
+  "uvicorn>=0.30",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+telegram-reader = "telegram_reader.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

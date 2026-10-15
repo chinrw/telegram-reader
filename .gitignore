@@ -1,0 +1,17 @@
+# Telegram sessions and credentials. Never commit these.
+*.session
+*.session-journal
+.env
+.env.*
+
+# Python build and cache artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Nix build output.
+result
+result-*
