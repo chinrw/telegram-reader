@@ -20,7 +20,8 @@ $ PYTHONPATH=src python -m unittest discover -s tests
 ```
 
 `nix flake check` builds the package, which runs the same tests, and evaluates the
-module with every option set.
+module with every option set. It builds only the files git tracks, so `git add` a
+new module or test before running it, or the check runs without them.
 
 ## Rules the code keeps
 
