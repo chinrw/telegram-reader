@@ -1,11 +1,14 @@
 """Unit tests for telegram_reader.server. Run: PYTHONPATH=src python -m unittest discover -s tests"""
 import asyncio
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest import mock
 
 from mcp.server.fastmcp.exceptions import ToolError
 from telethon import errors, utils
@@ -401,6 +404,25 @@ class ReaderTest(unittest.IsolatedAsyncioTestCase):
         reader = tr.Reader(make_client(fail=errors.FloodWaitError(request=None, capture=42)))
         with self.assertRaisesRegex(ToolError, "retry in 42 s"):
             await reader.read_messages("newsfeed")
+
+
+class SessionFileTest(unittest.TestCase):
+    def test_the_session_file_is_readable_by_its_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "api_id").write_text("12345\n")
+            Path(tmp, "api_hash").write_text("0" * 32 + "\n")
+            env = {
+                "TELEGRAM_API_ID_FILE": f"{tmp}/api_id",
+                "TELEGRAM_API_HASH_FILE": f"{tmp}/api_hash",
+                "TELEGRAM_READER_SESSION": f"{tmp}/reader",
+            }
+            previous = os.umask(0o022)
+            try:
+                with mock.patch.dict(os.environ, env):
+                    tr.make_client().session.close()
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(os.stat(f"{tmp}/reader.session").st_mode), 0o600)
 
 
 class ServerSurfaceTest(unittest.TestCase):

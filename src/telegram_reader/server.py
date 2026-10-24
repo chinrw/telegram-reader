@@ -586,7 +586,7 @@ def read_secret(env_name: str) -> str:
 
 
 def make_client() -> TelegramClient:
-    return TelegramClient(
+    client = TelegramClient(
         os.environ["TELEGRAM_READER_SESSION"],
         int(read_secret("TELEGRAM_API_ID_FILE")),
         read_secret("TELEGRAM_API_HASH_FILE"),
@@ -600,6 +600,10 @@ def make_client() -> TelegramClient:
         system_version="NixOS",
         app_version="1.0",
     )
+    # The session grants full control of the account. Telethon creates the file
+    # with the process umask, so it is tightened before connect() writes a key.
+    os.chmod(client.session.filename, 0o600)
+    return client
 
 
 class _Server(uvicorn.Server):
