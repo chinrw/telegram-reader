@@ -168,10 +168,6 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         poll = media_message(1, kind="poll")
         with self.assertRaisesRegex(ToolError, "no downloadable file"):
             await self.downloads.start("-1001:1", "newsfeed", "News", poll)
-        huge = media_message(2)
-        huge.file.size = dl.MAX_DOWNLOAD_BYTES + 1
-        with self.assertRaisesRegex(ToolError, "larger than"):
-            await self.downloads.start("-1001:2", "newsfeed", "News", huge)
         self.downloads.free_bytes = lambda fd: 10
         with self.assertRaisesRegex(ToolError, "free space"):
             await self.downloads.start("-1001:3", "newsfeed", "News", media_message(3))
@@ -216,12 +212,9 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("incomplete", failed["error"])
         self.assertEqual(list((self.root / "newsfeed").iterdir()), [])
 
-    async def test_downloads_without_a_reported_size_still_hit_the_cap(self):
+    async def test_a_download_without_a_reported_size_completes(self):
         msg = media_message(7, no_total=True)
         msg.file.size = None
-        job = dl.Job("j", "News", "newsfeed", "x", 7, "p", None)
-        with self.assertRaisesRegex(RuntimeError, "limit"):
-            job.progress(dl.MAX_DOWNLOAD_BYTES + 1, 0)
         await self.downloads.start("-1001:7", "newsfeed", "News", msg)
         self.assertEqual((await self.finish("-1001:7"))["status"], "done")
 

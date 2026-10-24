@@ -564,7 +564,7 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
         comes from the original file. These characters become "_": $ ` \\ " ' ; | & < > * ? { } ! : /
 
         Files are not executable and never overwrite anything. Asking again for the same post
-        returns the existing jobs. Poll download_status with each job_id. Up to 4 GiB per file.
+        returns the existing jobs. Poll download_status with each job_id.
         """
         return await reader.download_media(ref, message_id, name)
 

@@ -101,7 +101,9 @@ post is used. `<chat>` is the channel's username plus its id, such as
   agent cannot make them executable.
 - Existing files are never overwritten, and a symlink planted in the directory
   cannot redirect a download.
-- Up to 4 GiB per file, two downloads at a time, twenty queued or running.
+- Two downloads run at a time and twenty can be queued or running. A download
+  starts only if the disk has room for it, for the downloads still in progress,
+  and 1 GiB more.
 - The extension comes from the original file. The characters
   `` $ ` \ " ' ; | & < > * ? { } ! : / `` in names become `_`.
 

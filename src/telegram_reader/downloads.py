@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 
 from mcp.server.fastmcp.exceptions import ToolError
 
-# Telegram's own ceiling for premium accounts.
-MAX_DOWNLOAD_BYTES = 4 * 1024**3
 # Leave room for the rest of the media tree when downloads fill the disk.
 FREE_SPACE_MARGIN = 1024**3
 # Each download streams through the same proxy as the read tools.
@@ -123,9 +121,6 @@ class Job:
     task: asyncio.Task | None = field(default=None, repr=False)
 
     def progress(self, current: int, total: int) -> None:
-        # Telegram reports no size for some photos, so the cap is enforced here too.
-        if current > MAX_DOWNLOAD_BYTES:
-            raise RuntimeError(f"download passed the {MAX_DOWNLOAD_BYTES} byte limit")
         self.downloaded = current
         if total and self.size is None:
             self.size = total
@@ -222,8 +217,6 @@ class Downloads:
         if media_kind(msg) is None:
             raise ToolError("message has no downloadable file (web previews, polls, locations and contacts are not files)")
         size = getattr(msg.file, "size", None)
-        if size is not None and size > MAX_DOWNLOAD_BYTES:
-            raise ToolError(f"file is {size} bytes, larger than the {MAX_DOWNLOAD_BYTES} byte limit")
         active = [j for j in self._jobs.values() if j.status in ACTIVE]
         if len(active) >= MAX_ACTIVE_JOBS:
             raise ToolError(f"{len(active)} downloads are already queued or running; wait for some to finish")
@@ -271,8 +264,6 @@ class Downloads:
                 written = os.fstat(out.fileno())
                 if job.size is not None and written.st_size != job.size:
                     raise RuntimeError(f"download incomplete: got {written.st_size} of {job.size} bytes")
-                if written.st_size > MAX_DOWNLOAD_BYTES:
-                    raise RuntimeError(f"download passed the {MAX_DOWNLOAD_BYTES} byte limit")
                 # The agent can rename the part file away and put its own in its place.
                 named = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
                 if (named.st_dev, named.st_ino) != (written.st_dev, written.st_ino):
