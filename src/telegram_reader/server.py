@@ -591,8 +591,8 @@ def make_client() -> TelegramClient:
         int(read_secret("TELEGRAM_API_ID_FILE")),
         read_secret("TELEGRAM_API_HASH_FILE"),
         proxy=parse_proxy(os.environ.get("TELEGRAM_READER_PROXY")),
-        # Only request/response traffic is needed; skipping updates also keeps the
-        # account from looking like an always-on client.
+        # Telegram stops pushing updates. Telethon's update loop still polls
+        # getDifference for every chat whose state the session has stored.
         receive_updates=False,
         flood_sleep_threshold=FLOOD_SLEEP_SECONDS,
         # These show up under Settings > Devices, where the owner can end the session.
