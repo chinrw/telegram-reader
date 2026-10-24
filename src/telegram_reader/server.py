@@ -9,6 +9,7 @@ Nothing here sends, joins, marks read or otherwise acts on the account.
 Usage:
   telegram-reader serve --port 9520
   telegram-reader login
+  telegram-reader call read_messages chat=@newsfeed limit=5
 Env: TELEGRAM_API_ID_FILE, TELEGRAM_API_HASH_FILE, TELEGRAM_READER_SESSION,
 TELEGRAM_READER_DOWNLOADS (optional download root; unset disables downloads),
 TELEGRAM_READER_PROXY (optional http:// or socks5:// URL).
@@ -37,6 +38,7 @@ from mcp.types import ToolAnnotations
 from telethon import TelegramClient, errors, utils
 from telethon.tl import types
 
+from telegram_reader.call import run_call
 from telegram_reader.downloads import Downloads, default_base, media_kind
 
 DEFAULT_LIMIT = 20
@@ -650,7 +652,13 @@ def main(argv: list[str] | None = None) -> int:
     serve_cmd = sub.add_parser("serve", help="run the MCP server")
     serve_cmd.add_argument("--port", type=int, default=9520)
     sub.add_parser("login", help="log the account in interactively")
+    call_cmd = sub.add_parser("call", help="run one tool on the running server and print its JSON result")
+    call_cmd.add_argument("--port", type=int, default=9520)
+    call_cmd.add_argument("tool")
+    call_cmd.add_argument("args", nargs="*", metavar="key=value")
     args = parser.parse_args(argv)
+    if args.command == "call":
+        return run_call(f"http://{HOST}:{args.port}/mcp", args.tool, args.args)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     if args.command == "login":
         return asyncio.run(login())

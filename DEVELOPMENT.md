@@ -6,6 +6,8 @@
   login and serve commands, and turns Telethon errors into tool errors.
 - `src/telegram_reader/downloads.py` holds the background download jobs and file
   naming.
+- `src/telegram_reader/call.py` is the `call` subcommand, a plain HTTP client for
+  scripts. It never loads the session.
 - `nix/nixos.nix` is the NixOS module. `flake.nix` exports it with the package.
 - `tests/` runs offline. `tests/fakes.py` stands in for the Telethon client, so no
   account or network access is needed.

@@ -84,6 +84,25 @@ $ telegram-reader serve --port 9520
 Chats can be given as the id from `list_chats`, a `@username`, or a `t.me` link.
 Public channels can be read without joining them.
 
+## Call the tools from scripts
+
+`telegram-reader call` runs one tool on the running server and prints its JSON
+result, so a cron job or shell script can read Telegram without an LLM. Arguments
+are `key=value` pairs. A misspelled name is refused with the list of names the tool
+takes. Pass `--port` when the server does not listen on 9520.
+
+```console
+$ telegram-reader call list_chats kind=channel
+$ telegram-reader call read_messages chat=@newsfeed limit=5 since=2026-10-01
+$ telegram-reader call search_messages query=release chat=newsfeed
+$ telegram-reader call download_media ref=https://t.me/newsfeed/123 name="Show - 01"
+$ telegram-reader call download_status
+```
+
+The command needs no credentials, since it only talks to the server. A tool error,
+a refused argument or an unreachable server prints the reason on stderr and exits 1.
+Photos from `get_message` are left out of the output.
+
 ## Downloads
 
 Ask the agent to read the post and pass a clean title as `name`. Files are saved as
