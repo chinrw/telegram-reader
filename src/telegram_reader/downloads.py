@@ -106,6 +106,10 @@ def _describe(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+def _fingerprint(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
 @dataclass
 class Job:
     job_id: str
@@ -119,6 +123,7 @@ class Job:
     status: str = "queued"
     error: str | None = None
     task: asyncio.Task | None = field(default=None, repr=False)
+    fingerprint: tuple[int, int, int, int, int] | None = field(default=None, repr=False)
 
     def progress(self, current: int, total: int) -> None:
         self.downloaded = current
@@ -193,18 +198,31 @@ class Downloads:
     def free_slots(self) -> int:
         return MAX_ACTIVE_JOBS - sum(1 for j in self._jobs.values() if j.status in ACTIVE)
 
+    def _check_done(self, job: Job) -> None:
+        if job.status != "done":
+            return
+        try:
+            root_fd = self._open_root()
+            try:
+                dir_fd = os.open(job.chat_dir, DIR_FLAGS, dir_fd=root_fd)
+            finally:
+                os.close(root_fd)
+            try:
+                current = os.stat(job.name, dir_fd=dir_fd, follow_symlinks=False)
+            finally:
+                os.close(dir_fd)
+        except (OSError, ToolError) as exc:
+            job.status, job.error = "failed", f"downloaded file cannot be verified: {_describe(exc)}"
+            return
+        if _fingerprint(current) != job.fingerprint:
+            job.status, job.error = "failed", "downloaded file changed; move it away before downloading again"
+
     def _known_job(self, job_id: str) -> Job | None:
         job = self._jobs.get(job_id)
-        if job is None or job.status == "failed":
+        if job is None:
             return None
-        if job.status == "done":
-            # The agent is expected to move finished files away; then the job is stale.
-            try:
-                os.lstat(job.path)
-            except FileNotFoundError:
-                del self._jobs[job_id]
-                return None
-        return job
+        self._check_done(job)
+        return job if job.status != "failed" else None
 
     async def start(
         self, job_id: str, chat_dir: str, chat_title: str, msg, base: str | None = None, index: str | None = None
@@ -225,12 +243,8 @@ class Downloads:
         dir_fd = self._open_chat_dir(chat_dir)
         try:
             with contextlib.suppress(FileNotFoundError):
-                existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                if stat.S_ISREG(existing.st_mode) and size is not None and existing.st_size == size:
-                    job = Job(job_id, chat_title, chat_dir, name, msg.id, path, size, downloaded=size, status="done")
-                    self._remember(job)
-                    return job.view()
-                raise ToolError(f"{path} already exists and is not this file; move it away first")
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                raise ToolError(f"{path} already exists; cannot verify it is this download, so move it away first")
             # Queued jobs have written nothing yet, so their bytes are reserved here.
             reserved = sum(j.outstanding() for j in active)
             if self.free_bytes(dir_fd) < (size or 0) + reserved + FREE_SPACE_MARGIN:
@@ -269,7 +283,11 @@ class Downloads:
                 if (named.st_dev, named.st_ino) != (written.st_dev, written.st_ino):
                     raise RuntimeError("the partial file was replaced during the download")
                 job.downloaded = job.size = written.st_size
-            os.link(part, job.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+                os.link(part, job.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+                os.unlink(part, dir_fd=dir_fd)
+                # Linking and unlinking change ctime. Keep the original fd open
+                # until publication is finished so replacements cannot set the baseline.
+                job.fingerprint = _fingerprint(os.fstat(out.fileno()))
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(part, dir_fd=dir_fd)
@@ -311,11 +329,12 @@ class Downloads:
                     continue
                 try:
                     for entry in os.scandir(chat_fd):
-                        if not PART_RE.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
-                            continue
-                        if entry.stat(follow_symlinks=False).st_uid == self.owner_uid:
-                            os.unlink(entry.name, dir_fd=chat_fd)
-                            removed += 1
+                        with contextlib.suppress(FileNotFoundError):
+                            if not PART_RE.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
+                                continue
+                            if entry.stat(follow_symlinks=False).st_uid == self.owner_uid:
+                                os.unlink(entry.name, dir_fd=chat_fd)
+                                removed += 1
                 finally:
                     os.close(chat_fd)
         finally:
@@ -324,14 +343,17 @@ class Downloads:
 
     def status(self, job_id: str = "") -> dict:
         if not job_id:
+            for job in self._jobs.values():
+                self._check_done(job)
             return {"jobs": [job.view() for job in self._jobs.values()]}
         job = self._jobs.get(job_id)
         if job is None:
             raise ToolError("unknown job; jobs do not survive a service restart, so start the download again")
+        self._check_done(job)
         return job.view()
 
     async def wait(self, job_id: str) -> dict:
         job = self._jobs[job_id]
         if job.task is not None:
             await asyncio.shield(job.task)
-        return job.view()
+        return self.status(job_id)

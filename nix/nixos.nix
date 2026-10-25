@@ -16,6 +16,8 @@ let
   session = "${stateDir}/reader";
   downloadsDir = cfg.downloads.directory;
   downloadsParent = dirOf downloadsDir;
+  # Unit files need token quoting and literal-percent escaping, independently of shell arguments.
+  unitPath = value: builtins.toJSON (lib.replaceStrings [ "%" ] [ "%%" ] value);
 
   # systemd's IP filter takes addresses only, so it is applied when the proxy
   # is given as an IPv4 literal and skipped for host names.
@@ -24,9 +26,9 @@ let
       null
     else
       let
-        found = builtins.match "[a-z0-9]+://([^/@]+@)?([0-9.]+):[0-9]+/?" cfg.proxy;
+        found = builtins.match "[a-z0-9]+://([0-9.]+):[0-9]+/?" cfg.proxy;
       in
-      if found == null then null else builtins.elemAt found 1;
+      if found == null then null else builtins.elemAt found 0;
 
   environment = {
     TELEGRAM_API_ID_FILE = cfg.apiIdFile;
@@ -42,6 +44,8 @@ let
 
   login = pkgs.writeShellApplication {
     name = "telegram-reader-login";
+    # Shell-like text in configured environment values must stay literal.
+    excludeShellChecks = [ "SC2016" ];
     runtimeInputs = [
       pkgs.coreutils
       pkgs.systemd
@@ -75,6 +79,8 @@ let
       "telegram-reader needs setfacl -P to refuse symlinks atomically (acl >= 2.4.0)";
     pkgs.writeShellApplication {
       name = "telegram-reader-prepare-downloads";
+      # Shell-like text in configured paths and user names must stay literal.
+      excludeShellChecks = [ "SC2016" ];
       runtimeInputs = [
         pkgs.acl
         pkgs.coreutils
@@ -83,13 +89,13 @@ let
       text = ''
         umask 002
         ${lib.optionalString (cfg.downloads.createAs != null) ''
-          if [ ! -e ${downloadsDir} ] && [ ! -L ${downloadsDir} ]; then
+          if [ ! -e ${lib.escapeShellArg downloadsDir} ] && [ ! -L ${lib.escapeShellArg downloadsDir} ]; then
             # Plain mkdir by the tree's owner inherits the parent's setgid
             # group and default ACLs, which chmod or chgrp would not keep.
-            runuser -u ${cfg.downloads.createAs} -- mkdir ${downloadsDir}
+            runuser -u ${lib.escapeShellArg cfg.downloads.createAs} -- mkdir ${lib.escapeShellArg downloadsDir}
           fi
         ''}
-        setfacl -P -m u:${user}:rwx,d:u:${user}:rwx ${downloadsDir}
+        setfacl -P -m u:${user}:rwx,d:u:${user}:rwx ${lib.escapeShellArg downloadsDir}
       '';
     };
 in
@@ -130,23 +136,24 @@ in
     };
 
     proxy = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
+      type = lib.types.nullOr (lib.types.strMatching "[^@]*");
       default = null;
       example = "http://192.0.2.10:8080";
       description = ''
-        HTTP CONNECT or SOCKS proxy for MTProto traffic, as protocol://host:port.
+        HTTP CONNECT or SOCKS proxy for MTProto traffic, as protocol://host:port,
+        without embedded credentials.
         With an IPv4 literal, the service may reach only loopback and that address.
       '';
     };
 
     downloads = {
       directory = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
+        type = lib.types.nullOr (lib.types.strMatching "/.*");
         default = null;
         example = "/srv/media/telegram";
         description = ''
-          Where download_media saves files, one subdirectory per chat. The
-          agent must see it at the same path. Null disables downloads.
+          Absolute directory where download_media saves files, one subdirectory
+          per chat. The agent must see it at the same path. Null disables downloads.
         '';
       };
 
@@ -178,7 +185,7 @@ in
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
-      inherit environment;
+      environment = lib.mapAttrs (_: value: lib.replaceStrings [ "%" ] [ "%%" ] value) environment;
       # Until `sudo telegram-reader-login` creates the session there is
       # nothing to serve. The login wrapper starts the unit afterwards.
       unitConfig = {
@@ -186,7 +193,7 @@ in
       }
       // lib.optionalAttrs (downloadsDir != null) {
         # Wants, not Requires: without the mount only downloads should fail.
-        WantsMountsFor = [ downloadsParent ];
+        WantsMountsFor = [ (unitPath downloadsParent) ];
       };
       serviceConfig = {
         ExecStart = lib.escapeShellArgs [
@@ -249,7 +256,7 @@ in
         # The parent, not the directory itself: systemd resolves symlinks when
         # it builds the mount namespace, and the agent may be able to swap the
         # directory for one. File permissions still confine writes to it.
-        ReadWritePaths = [ "-${downloadsParent}" ];
+        ReadWritePaths = [ (unitPath "-${downloadsParent}") ];
       };
     };
   };

@@ -2,8 +2,9 @@
 
 The account session can do anything the owner can, so it stays in this
 service's state directory, which the agent must not be able to read. The agent
-gets read tools plus media downloads, and only for channels and groups: private
-chats, bots and Saved Messages are refused before any history request is made.
+gets read tools plus media downloads, and only for channels and groups. Explicit
+chat requests refuse private chats, bots and Saved Messages before fetching
+messages; global search filters these hits before returning them.
 Nothing here sends, joins, marks read or otherwise acts on the account.
 
 Usage:
@@ -134,7 +135,10 @@ def parse_chat_ref(ref: str | int) -> str | int:
         return int(text)
     match = LINK_RE.match(text)
     if match:
-        text = match["path"].split("/")[0]
+        parts = match["path"].split("/")
+        if parts[0] == "c" and len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 0:
+            return utils.get_peer_id(types.PeerChannel(int(parts[1])))
+        text = parts[0]
     name = text.removeprefix("@")
     if not USERNAME_RE.fullmatch(name):
         raise ValueError(f"chat must be an id from list_chats, a @username or a t.me link, got {ref!r}")
@@ -145,6 +149,8 @@ def parse_proxy(url: str | None) -> dict | None:
     if not url:
         return None
     parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("TELEGRAM_READER_PROXY does not support proxy credentials")
     if parts.scheme not in ("http", "socks5", "socks4") or not parts.hostname or not parts.port:
         # The URL itself is left out of the message because it may carry credentials.
         raise ValueError("TELEGRAM_READER_PROXY must look like http://host:port")
@@ -405,8 +411,11 @@ class Reader:
                 "messages": [serialize_message(msg, entity) async for msg in found if same_chat(msg, entity)],
             })
         results = []
-        found = self._client.iter_messages(None, limit=limit * GLOBAL_SEARCH_SCAN_FACTOR, search=query)
+        scan_limit = limit * GLOBAL_SEARCH_SCAN_FACTOR
+        scanned = 0
+        found = self._client.iter_messages(None, limit=scan_limit, search=query)
         async for msg in found:
+            scanned += 1
             # msg.chat is None when Telegram left the chat out of the response; that hit is dropped too.
             if chat_kind(msg.chat) is None or not same_chat(msg, msg.chat):
                 continue
@@ -415,7 +424,7 @@ class Reader:
             results.append(item)
             if len(results) >= limit:
                 break
-        return with_notice({"messages": results})
+        return with_notice({"messages": results, "truncated": scanned >= scan_limit and len(results) < limit})
 
     async def _fetch_message(self, ref: str | int, message_id: int):
         if message_id:
@@ -469,20 +478,28 @@ class Reader:
             raise ToolError("downloads are not configured on this server")
         entity, msg = await self._fetch_message(ref, message_id)
         items = await self._album(entity, msg)
-        if len(items) > self._downloads.free_slots():
+        peer = utils.get_peer_id(entity)
+        # Creating new jobs can evict completed records, so retain verified results for this request.
+        jobs = []
+        for item in items:
+            job = self._downloads._known_job(f"{peer}:{item.id}")
+            jobs.append(job.view() if job is not None else None)
+        needed = sum(job is None for job in jobs)
+        if needed > self._downloads.free_slots():
             raise ToolError("too many downloads are queued or running for this post; wait for some to finish")
         # An album usually carries its text on one member only; every file is named after it.
         captioned = next((m for m in items if (m.message or "").strip()), msg)
         base = name.strip() or default_base(captioned)
-        peer, chat_dir, title = utils.get_peer_id(entity), chat_dir_name(entity), utils.get_display_name(entity)
-        jobs = []
+        chat_dir, title = chat_dir_name(entity), utils.get_display_name(entity)
         for number, item in enumerate(items, 1):
+            if jobs[number - 1] is not None:
+                continue
             index = f"{number:02d}" if len(items) > 1 else None
             try:
-                jobs.append(await self._downloads.start(f"{peer}:{item.id}", chat_dir, title, item, base, index))
+                jobs[number - 1] = await self._downloads.start(f"{peer}:{item.id}", chat_dir, title, item, base, index)
             except ToolError as exc:
                 # One refused file (say, a name already taken) must not hide the others' jobs.
-                jobs.append({"message_id": item.id, "status": "refused", "error": str(exc)})
+                jobs[number - 1] = {"message_id": item.id, "status": "refused", "error": str(exc)}
         return with_notice({"jobs": jobs})
 
     def download_status(self, job_id: str = "") -> dict:
@@ -515,7 +532,7 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
     ) -> dict:
         """List the channels and groups this account has joined, most recent activity first.
 
-        query filters by title or @username (case-insensitive). Each entry's id can be passed
+        query filters titles and usernames by a case-insensitive substring. Each entry's id can be passed
         as `chat` to the other tools. limit is capped at 200.
         """
         return await reader.list_chats(kind, query, limit)
@@ -537,6 +554,8 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
     async def search_messages(query: str, chat: str | int = "", limit: int = DEFAULT_LIMIT) -> dict:
         """Search message text. With chat, search that channel or group; without, search
         every joined channel and group (private chats are never returned). limit is capped at 100.
+        Global search scans at most 3 * limit hits. If filtering exhausts that budget before
+        enough readable results are found, truncated is true and matching posts may be missing.
         """
         return await reader.search_messages(query, chat, limit)
 
@@ -565,7 +584,7 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
         album files as "<name> - 01 [<id>].<ext>", "<name> - 02 [<id>].<ext>". The extension
         comes from the original file. These characters become "_": $ ` \\ " ' ; | & < > * ? { } ! : /
 
-        Files are not executable and never overwrite anything. Asking again for the same post
+        Files are created without execute bits and never overwrite anything. Asking again for the same post
         returns the existing jobs. Poll download_status with each job_id.
         """
         return await reader.download_media(ref, message_id, name)
@@ -573,7 +592,7 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
     @server.tool(annotations=read_only)
     async def download_status(job_id: str = "") -> dict:
         """Report one download job (status queued, running, done or failed, with bytes so far),
-        or every job since the service started when job_id is empty.
+        or all jobs still retained in memory (up to 200) when job_id is empty.
         """
         return reader.download_status(job_id)
 
@@ -585,14 +604,55 @@ def read_secret(env_name: str) -> str:
         return handle.read().strip()
 
 
-def make_client() -> TelegramClient:
-    client = TelegramClient(
+class _Client(TelegramClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dc_switches = 0
+        self._dc_failed = False
+        self._dc_ready = asyncio.Event()
+        self._dc_ready.set()
+
+    async def _switch_dc(self, new_dc):
+        # Telethon completes the old disconnect future before reconnecting.
+        # Nested or overlapping switches must finish before deciding to exit.
+        if not self._dc_switches:
+            self._dc_failed = False
+            self._dc_ready.clear()
+        self._dc_switches += 1
+        try:
+            return await super()._switch_dc(new_dc)
+        except BaseException:
+            self._dc_failed = True
+            raise
+        finally:
+            self._dc_switches -= 1
+            if not self._dc_switches:
+                self._dc_ready.set()
+
+    async def wait_disconnected(self):
+        while True:
+            disconnected = self.disconnected
+            try:
+                await asyncio.wait((disconnected,))
+                while self._dc_switches:
+                    await self._dc_ready.wait()
+                if self._dc_failed or not self.is_connected():
+                    result = await disconnected
+                    # The update loop disconnects cleanly after recording its error.
+                    if self._updates_error is not None:
+                        raise self._updates_error
+                    return result
+            finally:
+                disconnected.cancel()
+
+
+def make_client() -> _Client:
+    client = _Client(
         os.environ["TELEGRAM_READER_SESSION"],
         int(read_secret("TELEGRAM_API_ID_FILE")),
         read_secret("TELEGRAM_API_HASH_FILE"),
         proxy=parse_proxy(os.environ.get("TELEGRAM_READER_PROXY")),
-        # Telegram stops pushing updates. Telethon's update loop still polls
-        # getDifference for every chat whose state the session has stored.
+        # Suppress pushed updates. Telethon still synchronizes differences internally.
         receive_updates=False,
         flood_sleep_threshold=FLOOD_SLEEP_SECONDS,
         # These show up under Settings > Devices, where the owner can end the session.
@@ -634,8 +694,31 @@ async def serve(port: int) -> int:
                 log.info("removed %d partial downloads left by an earlier run", swept)
         reader = Reader(client, downloads)
         app = build_server(reader, port).streamable_http_app()
-        await _Server(uvicorn.Config(app, host=HOST, port=port, log_level="warning")).serve()
-        return 0
+        # A stalled HTTP body must not keep a disconnected backend alive.
+        server = _Server(uvicorn.Config(
+            app, host=HOST, port=port, log_level="warning", timeout_graceful_shutdown=10
+        ))
+        serving = asyncio.create_task(server.serve())
+        disconnected = asyncio.create_task(client.wait_disconnected())
+        try:
+            done, _ = await asyncio.wait((serving, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if serving in done:
+                await serving
+                return 0
+            try:
+                await disconnected
+            except (errors.UnauthorizedError, errors.AuthKeyError):
+                log.error("the session is no longer authorized; run `sudo telegram-reader-login`")
+                return EXIT_NOT_LOGGED_IN
+            except ConnectionError:
+                pass
+            log.error("Telegram disconnected; restarting the service")
+            return 1
+        finally:
+            server.should_exit = True
+            disconnected.cancel()
+            await asyncio.gather(disconnected, return_exceptions=True)
+            await serving
     finally:
         await client.disconnect()
 

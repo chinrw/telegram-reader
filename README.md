@@ -42,6 +42,9 @@ inputs.telegram-reader = {
 }
 ```
 
+Proxy URLs must not contain usernames or passwords. Do not put credentials in
+Nix configuration.
+
 After switching, log the account in once. It asks for your phone number, the login
 code Telegram sends you, and your two-step verification password if you set one:
 
@@ -53,6 +56,12 @@ The service starts when the login succeeds. Point your agent at
 `config.services.telegram-reader.url`, which is `http://127.0.0.1:9520/mcp` by
 default. The session shows up in Telegram under Settings > Devices with your host
 name, and ending it there logs the server out.
+
+A permanent Telegram disconnection stops the server so the NixOS unit can restart
+it. The server allows ten seconds for HTTP requests to drain during shutdown,
+then cancels requests still running. An unauthorized session needs a new login.
+Successful DC migrations keep the server running, though individual in-flight
+requests may still fail while Telegram reconnects.
 
 ## Run it without NixOS
 
@@ -74,7 +83,7 @@ $ telegram-reader serve --port 9520
 
 | Tool | What it does |
 |---|---|
-| `list_chats` | Lists joined channels and groups, filtered by kind or title. |
+| `list_chats` | Lists up to 200 joined channels and groups, filtered by kind or a title/username substring. There is no paging. |
 | `read_messages` | Reads recent messages of one chat, newest first, with paging and a date cutoff. |
 | `search_messages` | Searches one chat, or every joined channel and group. |
 | `get_message` | Fetches one message by `t.me` link. Photos come back as images the model can see. |
@@ -82,7 +91,13 @@ $ telegram-reader serve --port 9520
 | `download_status` | Reports download progress. |
 
 Chats can be given as the id from `list_chats`, a `@username`, or a `t.me` link.
-Public channels can be read without joining them.
+Private-channel links such as `https://t.me/c/123456/789` work too. Public channels
+can be read without joining them.
+
+Global search examines at most `3 * limit` hits before filtering out private
+chats. If this budget runs out before enough readable results are found, the
+result has `truncated: true`: matching posts may be missing. Search a specific
+chat to avoid this global scan limit.
 
 ## Call the tools from scripts
 
@@ -114,19 +129,23 @@ Ask the agent to read the post and pass a clean title as `name`. Files are saved
 and every file of an album as `<name> - 01 [<id>].<ext>`, `<name> - 02 [<id>].<ext>`,
 and so on, named after the album's text. Without a `name`, the first line of the
 post is used. `<chat>` is the channel's username plus its id, such as
-`newsfeed-c1234567890`, or just the id for private chats.
+`newsfeed-c1234567890`, or an id-based name when the chat has no username.
 
-- Files are created without execute bits and owned by the service user, so the
-  agent cannot make them executable.
+- Files are created without execute bits and owned by the service user. A writer
+  in the directory can replace or copy them, and interpreters can read them
+  without execute permission.
 - Existing files are never overwritten, and a symlink planted in the directory
   cannot redirect a download.
 - Two downloads run at a time and twenty can be queued or running. A download
   starts only if the disk has room for it, for the downloads still in progress,
   and 1 GiB more.
+- Album capacity is checked as a whole, counting only new jobs. Requesting an
+  existing job does not need a free slot.
 - The extension comes from the original file. The characters
   `` $ ` \ " ' ; | & < > * ? { } ! : / `` in names become `_`.
 
-The module grants the service user access to the directory with an ACL. Set
+The module requires an absolute download directory and grants the service user
+access to it with an ACL. Set
 `downloads.createAs` to a user who should create it with plain `mkdir`, so it
 inherits the parent directory's group and default ACLs.
 
@@ -146,8 +165,13 @@ and other strings that would make Telegram look up your contacts.
 
 - The endpoint has no authentication. It listens on 127.0.0.1 only and rejects
   foreign `Host` and `Origin` headers, but any local process can call it.
-- Download jobs live in memory. After a restart, ask for the post again. Finished
-  files are recognized and not fetched twice.
+- Download jobs and completion records live in memory. The server keeps at most
+  200 jobs, retaining active jobs and discarding older completed or failed ones.
+  A completed file is reused only while its record is retained and its metadata
+  still matches. Moving, deleting or changing it makes the job report `failed`;
+  ask for the post again to download it again. After a restart or record eviction,
+  move an existing destination file away first: the server cannot verify its
+  origin and will not overwrite it or assume it is complete from its size.
 - A job that waits a long time in the queue can fail when Telegram's file reference
   expires. Asking again fixes it.
 

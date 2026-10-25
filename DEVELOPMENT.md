@@ -25,9 +25,11 @@ new module or test before running it, or the check runs without them.
 
 ## Rules the code keeps
 
-- Every path that returns messages checks the chat kind before the request and
-  the message's peer after it. Basic-group message ids share one numbering with
-  private chats, so a fetch by id can return a private message.
+- Explicit-chat operations check the chat kind before requesting messages.
+  Global search retrieves account-wide hits inside the trusted service and
+  filters their chat kinds before returning them. Every returned message's peer
+  is checked. Basic-group message ids share one numbering with private chats,
+  so a fetch by id can return a private message.
 - The download directory is shared with the agent, which can rename and replace
   entries in it. All writes go through directory descriptors opened with
   `O_NOFOLLOW`. Files are created with `O_EXCL` under a `.part` name and published
