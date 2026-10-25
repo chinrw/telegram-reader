@@ -50,6 +50,11 @@ class CallTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([m["id"] for m in json.loads(out)["messages"]], [10, 9])
 
+    def test_list_arguments_are_parsed_from_json(self):
+        code, out, err = self.run_call("find_media", "chat=chatroom", "sizes=[7]")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([m["id"] for m in json.loads(out)["messages"]], [13])
+
     def test_string_values_take_the_types_the_tool_declares(self):
         args = {"ref": "https://t.me/chatroom/11", "include_photo": "false"}
         result = call.rpc(self.url, "tools/call", {"name": "get_message", "arguments": args})

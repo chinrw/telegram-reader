@@ -981,6 +981,66 @@ class DCMigrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.http.should_exit)
 
 
+class FindAndCheckTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.client = make_client()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.reader = tr.Reader(self.client, dl.Downloads(self.client, self.tmp.name, part_hashes=fakes.part_hashes))
+
+    async def test_find_media_returns_this_chats_posts_with_the_given_sizes(self):
+        found = await self.reader.find_media("@chatroom", [7, 1, 999])
+        # 25 has the same size but belongs to a private chat, so it never shows up.
+        self.assertEqual([m["id"] for m in found["messages"]], [24, 23, 22, 21, 13])
+        self.assertEqual(found["messages"][-1]["media"]["name"], "pack.zip")
+        self.assertIsNone(found["next_before_id"])
+        self.assertEqual(found["notice"], tr.NOTICE)
+
+    async def test_find_media_pages_through_the_history(self):
+        with mock.patch.object(tr, "FIND_SCAN_LIMIT", 4):
+            first = await self.reader.find_media("@chatroom", [1, 7])
+            self.assertEqual(([m["id"] for m in first["messages"]], first["next_before_id"]), ([24, 23, 22], 22))
+            rest = await self.reader.find_media("@chatroom", [1, 7], before_id=first["next_before_id"])
+            # A full page cannot tell whether older messages exist, so one more call ends it.
+            last = await self.reader.find_media("@chatroom", [1, 7], before_id=rest["next_before_id"])
+        self.assertEqual(([m["id"] for m in rest["messages"]], rest["next_before_id"]), ([21, 13], 11))
+        self.assertEqual((last["messages"], last["scanned"], last["next_before_id"]), ([], 0, None))
+
+    async def test_find_media_refuses_bad_requests_before_reading_history(self):
+        for chat, sizes, message in [
+            ("@chatroom", [], "sizes is empty"),
+            ("@chatroom", [0, -3], "sizes is empty"),
+            ("@chatroom", list(range(1, tr.MAX_FIND_SIZES + 2)), "at most"),
+            ("@alice", [7], "only channels and groups"),
+        ]:
+            with self.subTest(chat=chat, sizes=sizes[:3]):
+                with self.assertRaisesRegex(ToolError, message):
+                    await self.reader.find_media(chat, sizes)
+        self.assertEqual(self.client.iter_calls, [])
+
+    async def test_check_file_compares_a_local_file_with_the_post(self):
+        (self.root / "pack.zip").write_bytes(b"zipdata")
+        (self.root / "other.zip").write_bytes(b"zipDATA")
+        same = await self.reader.check_file(str(self.root / "pack.zip"), "https://t.me/chatroom/13")
+        self.assertEqual((same["match"], same["size"], same["message"]["id"]), (True, 7, 13))
+        other = await self.reader.check_file("other.zip", "chatroom", message_id=13)
+        self.assertFalse(other["match"])
+        self.assertEqual((self.root / "other.zip").read_bytes(), b"zipDATA")
+
+    async def test_check_file_refuses_private_chats_and_outside_paths(self):
+        (self.root / "pack.zip").write_bytes(b"zipdata")
+        with self.assertRaisesRegex(ToolError, "only channels and groups"):
+            await self.reader.check_file("missing.zip", "alice", message_id=1)
+        with self.assertRaisesRegex(ToolError, "inside"):
+            await self.reader.check_file("/etc/hostname", "https://t.me/chatroom/13")
+        with self.assertRaisesRegex(ToolError, "no file"):
+            await self.reader.check_file("pack.zip", "https://t.me/newsfeed/3")
+        no_downloads = tr.Reader(self.client)
+        with self.assertRaisesRegex(ToolError, "not configured"):
+            await no_downloads.check_file("pack.zip", "https://t.me/chatroom/13")
+
+
 class SessionFileTest(unittest.TestCase):
     def test_the_session_file_is_readable_by_its_owner_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1008,7 +1068,10 @@ class ServerSurfaceTest(unittest.TestCase):
         tools = {tool.name: tool for tool in asyncio.run(self.server.list_tools())}
         self.assertEqual(
             set(tools),
-            {"list_chats", "read_messages", "search_messages", "get_message", "download_media", "download_status"},
+            {
+                "list_chats", "read_messages", "search_messages", "get_message",
+                "download_media", "download_status", "find_media", "check_file",
+            },
         )
         writers = {name for name, tool in tools.items() if not tool.annotations.readOnlyHint}
         self.assertEqual(writers, {"download_media"})

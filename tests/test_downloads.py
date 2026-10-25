@@ -12,6 +12,7 @@ from unittest import mock
 
 from mcp.server.fastmcp.exceptions import ToolError
 
+import fakes
 from telegram_reader import downloads as dl
 
 NOW = datetime(2026, 10, 15, tzinfo=timezone.utc)
@@ -71,7 +72,18 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name) / "telegram"
         self.root.mkdir()
         self.client = FakeDownloader()
-        self.downloads = dl.Downloads(self.client, str(self.root))
+        self.hash_calls = []
+        self.downloads = dl.Downloads(self.client, str(self.root), part_hashes=self.part_hashes)
+
+    async def part_hashes(self, msg, offset):
+        self.hash_calls.append((msg.id, offset))
+        return await fakes.part_hashes(msg, offset)
+
+    def place(self, data, name="file [7].zip"):
+        (self.root / "newsfeed").mkdir(exist_ok=True)
+        target = self.root / "newsfeed" / name
+        target.write_bytes(data)
+        return target
 
     async def finish(self, job_id):
         return await self.downloads.wait(job_id)
@@ -118,14 +130,62 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "done")
         self.assertEqual(self.client.started, [7])
 
-    async def test_a_restart_does_not_trust_previous_downloads(self):
+    async def test_a_restart_recognizes_an_earlier_download_by_its_hashes(self):
         msg = media_message(7)
         await self.downloads.start("-1001:7", "newsfeed", "News", msg)
         await self.finish("-1001:7")
-        fresh = dl.Downloads(self.client, str(self.root))
-        with self.assertRaisesRegex(ToolError, "cannot verify"):
-            await fresh.start("-1001:7", "newsfeed", "News", msg)
+        fresh = dl.Downloads(self.client, str(self.root), part_hashes=self.part_hashes)
+        result = await fresh.start("-1001:7", "newsfeed", "News", msg)
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(fresh.status("-1001:7")["status"], "done")
         self.assertEqual(self.client.started, [7])
+
+    async def test_an_existing_file_is_checked_in_three_windows_including_the_short_last_part(self):
+        payload = os.urandom(3 * fakes.WINDOW + 1000)
+        msg = media_message(7, payload=payload)
+        target = self.place(payload)
+        result = await self.downloads.start("-1001:7", "newsfeed", "News", msg)
+        self.assertEqual(result["status"], "done")
+        self.assertEqual([offset for _, offset in self.hash_calls], [0, len(payload) // 2, len(payload) - 1])
+        self.assertEqual(self.client.started, [])
+        target.write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+        fresh = dl.Downloads(self.client, str(self.root), part_hashes=self.part_hashes)
+        with self.assertRaisesRegex(ToolError, "does not match this post; left it untouched"):
+            await fresh.start("-1001:7", "newsfeed", "News", msg)
+
+    async def test_a_symlink_or_fifo_at_the_target_is_refused_untouched(self):
+        outside = Path(self.tmp.name) / "outside.zip"
+        outside.write_bytes(b"payload")
+        self.place(b"")
+        target = self.root / "newsfeed" / "file [7].zip"
+        target.unlink()
+        target.symlink_to(outside)
+        with self.assertRaisesRegex(ToolError, "as a symlink; left it untouched"):
+            await self.downloads.start("-1001:7", "newsfeed", "News", media_message(7))
+        target.unlink()
+        os.mkfifo(target)
+        with self.assertRaisesRegex(ToolError, "not a plain file"):
+            await asyncio.wait_for(self.downloads.start("-1001:7", "newsfeed", "News", media_message(7)), 5)
+        self.assertEqual((self.hash_calls, self.client.started), ([], []))
+        self.assertEqual(outside.read_bytes(), b"payload")
+
+    async def test_failing_to_reach_telegram_is_a_tool_error_for_that_file_only(self):
+        self.place(b"payload")
+
+        async def unreachable(msg, offset):
+            raise ConnectionError("proxy dropped")
+
+        downloads = dl.Downloads(self.client, str(self.root), part_hashes=unreachable)
+        with self.assertRaisesRegex(ToolError, r"comparing it with Telegram failed \(proxy dropped\); left it untouched"):
+            await downloads.start("-1001:7", "newsfeed", "News", media_message(7))
+        self.assertEqual((self.root / "newsfeed" / "file [7].zip").read_bytes(), b"payload")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads any file")
+    async def test_an_unreadable_existing_file_is_reported_as_such(self):
+        target = self.place(b"payload")
+        target.chmod(0)
+        with self.assertRaisesRegex(ToolError, "already exists but cannot be read"):
+            await self.downloads.start("-1001:7", "newsfeed", "News", media_message(7))
 
     async def test_a_different_file_at_the_target_is_never_overwritten(self):
         (self.root / "newsfeed").mkdir()
@@ -133,12 +193,12 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ToolError, "already exists"):
             await self.downloads.start("-1001:7", "newsfeed", "News", media_message(7))
         self.assertEqual((self.root / "newsfeed" / "file [7].zip").read_bytes(), b"someone else's")
+        # A size that differs settles it without asking Telegram.
+        self.assertEqual(self.hash_calls, [])
 
-    async def test_preexisting_same_size_file_is_not_assumed_complete(self):
-        (self.root / "newsfeed").mkdir()
-        target = self.root / "newsfeed" / "file [7].zip"
-        target.write_bytes(b"tainted")
-        with self.assertRaisesRegex(ToolError, "cannot verify"):
+    async def test_a_same_size_file_with_other_bytes_is_not_taken_as_the_download(self):
+        target = self.place(b"tainted")
+        with self.assertRaisesRegex(ToolError, "does not match this post"):
             await self.downloads.start("-1001:7", "newsfeed", "News", media_message(7))
         self.assertEqual(target.read_bytes(), b"tainted")
         self.assertEqual(self.client.started, [])
@@ -157,12 +217,19 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result["status"], "failed")
                     self.assertIn("changed", result["error"])
 
-    async def test_reuse_refuses_changed_completed_files(self):
+    async def test_a_changed_completed_file_is_judged_again_by_its_bytes(self):
+        expected = {"symlink": "as a symlink", "rewrite": "does not match this post"}
         for msg_id, change in enumerate(("symlink", "replacement", "rewrite"), 1):
             with self.subTest(change=change):
                 msg = await self.changed_download(msg_id, change)
-                with self.assertRaisesRegex(ToolError, "cannot verify"):
-                    await self.downloads.start(f"-1001:{msg_id}", "newsfeed", "News", msg)
+                if change == "replacement":
+                    # Another inode, but the same bytes as the post: that is the download.
+                    result = await self.downloads.start(f"-1001:{msg_id}", "newsfeed", "News", msg)
+                    self.assertEqual(result["status"], "done")
+                else:
+                    with self.assertRaisesRegex(ToolError, expected[change]):
+                        await self.downloads.start(f"-1001:{msg_id}", "newsfeed", "News", msg)
+        self.assertEqual(self.client.started, [1, 2, 3])
 
     async def test_status_refuses_symlinked_completed_directories(self):
         for msg_id, directory in enumerate(("chat", "root"), 1):
@@ -213,6 +280,42 @@ class DownloadsTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ToolError, "not a plain directory"):
             await self.downloads.start("-1001:7", "newsfeed", "News", media_message(7))
         self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_open_file_reads_plain_files_inside_the_root_only(self):
+        nested = self.root / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "x.mp4").write_bytes(b"data")
+        for path in (str(nested / "x.mp4"), "a/b/x.mp4"):
+            with self.subTest(path=path):
+                fd = self.downloads.open_file(path)
+                self.assertEqual(os.read(fd, 10), b"data")
+                os.close(fd)
+        outside = Path(self.tmp.name) / "secret"
+        outside.write_bytes(b"secret")
+        (self.root / "link.mp4").symlink_to(outside)
+        (self.root / "dirlink").symlink_to(nested, target_is_directory=True)
+        os.mkfifo(self.root / "fifo")
+        refused = [
+            (str(outside), "inside"),
+            ("../secret", "inside"),
+            ("a/../../secret", "inside"),
+            (str(self.root), "inside"),
+            ("a/b/", "inside"),
+            ("link.mp4", "is a symlink"),
+            ("a/b/x\0.mp4", "inside"),
+            ("dirlink/x.mp4", "not a plain directory"),
+            ("a", "not a plain file"),
+            ("fifo", "not a plain file"),
+            ("missing.mp4", "does not exist"),
+        ]
+        if os.geteuid() != 0:
+            (self.root / "locked.mp4").write_bytes(b"x")
+            (self.root / "locked.mp4").chmod(0)
+            refused.append(("locked.mp4", "cannot read .*: Permission denied"))
+        for path, message in refused:
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ToolError, message):
+                    self.downloads.open_file(path)
 
     async def test_a_symlinked_root_is_refused(self):
         real = Path(self.tmp.name) / "real"

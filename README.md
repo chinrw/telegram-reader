@@ -89,6 +89,8 @@ $ telegram-reader serve --port 9520
 | `get_message` | Fetches one message by `t.me` link. Photos come back as images the model can see. |
 | `download_media` | Downloads a post's files in the background. |
 | `download_status` | Reports download progress. |
+| `find_media` | Finds posts in one chat whose file has one of the given sizes. |
+| `check_file` | Tells whether a file in the download directory is a given post's file. |
 
 Chats can be given as the id from `list_chats`, a `@username`, or a `t.me` link.
 Private-channel links such as `https://t.me/c/123456/789` work too. Public channels
@@ -98,6 +100,21 @@ Global search examines at most `3 * limit` hits before filtering out private
 chats. If this budget runs out before enough readable results are found, the
 result has `truncated: true`: matching posts may be missing. Search a specific
 chat to avoid this global scan limit.
+
+## Find the posts behind files you already have
+
+Files saved by hand from a Telegram app keep the uploader's file name, which is
+often just a date. To find their posts, pass the byte sizes of the files to
+`find_media` together with the chat they came from. Telegram's search does not
+match file names, so the server scans the chat's history, 2000 messages per call;
+pass `next_before_id` back until it is null. Then confirm each candidate with
+`check_file`. Renaming and moving the files is left to the agent.
+
+`check_file` compares Telegram's SHA-256 hashes of 128 KiB parts with the file at
+its start, middle and end. That costs at most three requests and 3 MiB of reading,
+and tells apart files that merely share a size. It is a sample: damage between
+those windows goes unnoticed. It only reads files inside the download directory,
+and never through a symlink.
 
 ## Call the tools from scripts
 
@@ -112,6 +129,7 @@ $ telegram-reader call read_messages chat=@newsfeed limit=5 since=2026-10-01
 $ telegram-reader call search_messages query=release chat=newsfeed
 $ telegram-reader call download_media ref=https://t.me/newsfeed/123 name="Show - 01"
 $ telegram-reader call download_status
+$ telegram-reader call find_media chat=newsfeed 'sizes=[1344170064, 97703126]'
 ```
 
 The command needs no credentials, since it only talks to the server. A tool error,
@@ -135,7 +153,10 @@ post is used. `<chat>` is the channel's username plus its id, such as
   in the directory can replace or copy them, and interpreters can read them
   without execute permission.
 - Existing files are never overwritten, and a symlink planted in the directory
-  cannot redirect a download.
+  cannot redirect a download. When a file with the same name and size is already
+  there, it counts as the download if Telegram's part hashes match it at its
+  start, middle and end, the same sample `check_file` takes. Otherwise the request
+  is refused and the file is left alone.
 - Two downloads run at a time and twenty can be queued or running. A download
   starts only if the disk has room for it, for the downloads still in progress,
   and 1 GiB more.
@@ -165,13 +186,10 @@ and other strings that would make Telegram look up your contacts.
 
 - The endpoint has no authentication. It listens on 127.0.0.1 only and rejects
   foreign `Host` and `Origin` headers, but any local process can call it.
-- Download jobs and completion records live in memory. The server keeps at most
-  200 jobs, retaining active jobs and discarding older completed or failed ones.
-  A completed file is reused only while its record is retained and its metadata
-  still matches. Moving, deleting or changing it makes the job report `failed`;
-  ask for the post again to download it again. After a restart or record eviction,
-  move an existing destination file away first: the server cannot verify its
-  origin and will not overwrite it or assume it is complete from its size.
+- Download jobs live in memory, at most 200 of them. Active jobs are kept, and
+  older completed or failed ones are discarded. Moving, deleting or changing a
+  completed file makes its job report `failed`. Asking for the post again
+  downloads it again, or reports it done when a matching file is back in place.
 - A job that waits a long time in the queue can fail when Telegram's file reference
   expires. Asking again fixes it.
 

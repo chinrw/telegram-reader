@@ -1,4 +1,5 @@
 """Telethon stand-ins for the unit tests. They mimic only what telegram_reader calls."""
+import hashlib
 from types import SimpleNamespace
 
 from telethon import utils
@@ -44,6 +45,21 @@ def message(id, date, text, chat, **fields):
         setattr(msg, name, value)
     msg.media = next((getattr(msg, name) for name in MEDIA_FIELDS if getattr(msg, name)), None)
     return msg
+
+
+# upload.getFileHashes answers with the 128 KiB parts of the 1 MiB window around an offset.
+PART = 128 * 1024
+WINDOW = 8 * PART
+
+
+async def part_hashes(msg, offset):
+    """The parts Telegram would report for msg.payload; the last one hashes only the bytes that exist."""
+    data = msg.payload
+    start = offset - offset % WINDOW
+    return [
+        SimpleNamespace(offset=o, limit=PART, hash=hashlib.sha256(data[o:o + PART]).digest())
+        for o in range(start, min(start + WINDOW, len(data)), PART)
+    ]
 
 
 def dialog(entity, marked_id, unread=0):

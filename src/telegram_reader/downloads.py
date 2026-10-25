@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import functools
 import logging
 import os
 import re
@@ -19,6 +20,8 @@ import unicodedata
 from dataclasses import dataclass, field
 
 from mcp.server.fastmcp.exceptions import ToolError
+
+from telegram_reader import verify
 
 # Leave room for the rest of the media tree when downloads fill the disk.
 FREE_SPACE_MARGIN = 1024**3
@@ -47,6 +50,8 @@ PART_RE = re.compile(r"\..+\.part")
 ACTIVE = ("queued", "running")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK keeps a FIFO planted under a checked name from hanging the open.
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 log = logging.getLogger("telegram_reader.downloads")
 
@@ -149,9 +154,11 @@ class Job:
 
 
 class Downloads:
-    def __init__(self, client, root: str, max_parallel: int = MAX_PARALLEL):
+    def __init__(self, client, root: str, max_parallel: int = MAX_PARALLEL, part_hashes=None):
         self._client = client
         self._root = root
+        # part_hashes(msg, offset) returns Telegram's part hashes; tests pass a stand-in.
+        self._part_hashes = part_hashes or functools.partial(verify.part_hashes, client)
         self._slots = asyncio.Semaphore(max_parallel)
         self._jobs: dict[str, Job] = {}
         # Files owned by this uid are ones the service wrote; anything else is the agent's.
@@ -188,6 +195,43 @@ class Downloads:
                 raise self._open_error(f"{self._root}/{chat_dir}", exc) from exc
         finally:
             os.close(root_fd)
+
+    async def matches(self, msg, fd: int) -> bool:
+        """Whether the open file holds the same bytes as msg's file, by size and part hashes."""
+        return await verify.file_matches(
+            functools.partial(self._part_hashes, msg), fd, getattr(msg.file, "size", None)
+        )
+
+    def open_file(self, path: str) -> int:
+        """Open a regular file under the download root for reading, never following a symlink."""
+        root = self._root.rstrip("/")
+        relative = path[len(root) + 1:] if path.startswith(root + "/") else path
+        parts = relative.split("/")
+        if "\0" in path or os.path.isabs(relative) or any(part in ("", ".", "..") for part in parts):
+            raise ToolError(f"path must be a file inside {self._root}, got {path!r}")
+        dir_fd = self._open_root()
+        try:
+            for part in parts[:-1]:
+                try:
+                    next_fd = os.open(part, DIR_FLAGS, dir_fd=dir_fd)
+                except OSError as exc:
+                    raise self._open_error(path, exc) from exc
+                os.close(dir_fd)
+                dir_fd = next_fd
+            try:
+                fd = os.open(parts[-1], READ_FLAGS, dir_fd=dir_fd)
+            except FileNotFoundError as exc:
+                raise ToolError(f"{path} does not exist") from exc
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ToolError(f"{path} is a symlink; refusing to follow it") from exc
+                raise ToolError(f"cannot read {path}: {exc.strerror}") from exc
+        finally:
+            os.close(dir_fd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise ToolError(f"{path} is not a plain file; refusing to read it")
+        return fd
 
     def _remember(self, job: Job) -> None:
         self._jobs[job.job_id] = job
@@ -242,9 +286,12 @@ class Downloads:
         path = os.path.join(self._root, chat_dir, name)
         dir_fd = self._open_chat_dir(chat_dir)
         try:
-            with contextlib.suppress(FileNotFoundError):
-                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                raise ToolError(f"{path} already exists; cannot verify it is this download, so move it away first")
+            existing = await self._existing(dir_fd, name, path, msg)
+            if existing is not None:
+                job = Job(job_id, chat_title, chat_dir, name, msg.id, path, existing.st_size,
+                          downloaded=existing.st_size, status="done", fingerprint=_fingerprint(existing))
+                self._remember(job)
+                return job.view()
             # Queued jobs have written nothing yet, so their bytes are reserved here.
             reserved = sum(j.outstanding() for j in active)
             if self.free_bytes(dir_fd) < (size or 0) + reserved + FREE_SPACE_MARGIN:
@@ -255,6 +302,38 @@ class Downloads:
         self._remember(job)
         job.task = asyncio.create_task(self._run(job, msg))
         return job.view()
+
+    async def _existing(self, dir_fd: int, name: str, path: str, msg) -> os.stat_result | None:
+        """The stat of a file already at name that matches msg's file, None when nothing is there.
+
+        A file left by an earlier run, or put there by anyone else, counts as
+        this download only when its part hashes match. Anything else is refused
+        and left untouched.
+        """
+        try:
+            fd = os.open(name, READ_FLAGS, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ToolError(f"{path} already exists as a symlink; left it untouched") from exc
+            raise ToolError(f"{path} already exists but cannot be read ({exc.strerror}); left it untouched") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ToolError(f"{path} already exists and is not a plain file; left it untouched")
+            try:
+                matched = await self.matches(msg, fd)
+            except Exception as exc:
+                # start() raises only ToolError, so one album member's failure cannot hide the others.
+                raise ToolError(
+                    f"{path} already exists; comparing it with Telegram failed ({_describe(exc)}); left it untouched"
+                ) from exc
+            if matched:
+                return st
+        finally:
+            os.close(fd)
+        raise ToolError(f"{path} already exists and does not match this post; left it untouched")
 
     def _create_part(self, dir_fd: int, part: str) -> int:
         try:

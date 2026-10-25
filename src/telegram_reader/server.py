@@ -63,6 +63,10 @@ LINK_RE = re.compile(r"^(?:https?://)?(?:t|telegram)\.me/(?:s/)?(?P<path>[^?#]+)
 # lookup would let the agent probe the owner's contacts. Only public usernames
 # and numeric ids get through.
 USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
+# find_media reads this many messages per call, the most Telethon fetches
+# without pausing between requests, so one call stays well inside client timeouts.
+FIND_SCAN_LIMIT = 2000
+MAX_FIND_SIZES = 1000
 # Telegram recompresses photos to at most 2560 px, which keeps them well under this.
 MAX_INLINE_PHOTO_BYTES = 5 * 1024**2
 # Album members share a grouped_id and sit next to each other, at most ten of them.
@@ -502,6 +506,51 @@ class Reader:
                 jobs[number - 1] = {"message_id": item.id, "status": "refused", "error": str(exc)}
         return with_notice({"jobs": jobs})
 
+    @telegram_call
+    async def find_media(self, chat: str | int, sizes: list[int], before_id: int = 0) -> dict:
+        wanted = {size for size in sizes if size > 0}
+        if not wanted:
+            raise ToolError("sizes is empty; pass the byte sizes of the files to look for")
+        if len(wanted) > MAX_FIND_SIZES:
+            raise ToolError(f"pass at most {MAX_FIND_SIZES} sizes per call")
+        entity = await self._resolve(chat)
+        messages = []
+        scanned = 0
+        last_id = None
+        async for msg in self._client.iter_messages(entity, limit=FIND_SCAN_LIMIT, offset_id=before_id):
+            scanned += 1
+            last_id = msg.id
+            if same_chat(msg, entity) and media_kind(msg) and getattr(msg.file, "size", None) in wanted:
+                messages.append(serialize_message(msg, entity))
+        return with_notice({
+            "chat": chat_summary(entity),
+            "messages": messages,
+            "scanned": scanned,
+            "next_before_id": last_id if scanned == FIND_SCAN_LIMIT else None,
+        })
+
+    @telegram_call
+    async def check_file(self, path: str, ref: str | int, message_id: int = 0) -> dict:
+        if self._downloads is None:
+            raise ToolError("downloads are not configured on this server")
+        # The chat check comes first, so a private chat is refused before any file is read.
+        entity, msg = await self._fetch_message(ref, message_id)
+        if media_kind(msg) is None:
+            raise ToolError("message has no file to compare with")
+        fd = self._downloads.open_file(path)
+        try:
+            size = os.fstat(fd).st_size
+            match = await self._downloads.matches(msg, fd)
+        finally:
+            os.close(fd)
+        return with_notice({
+            "path": path,
+            "size": size,
+            "match": match,
+            "chat": chat_summary(entity),
+            "message": serialize_message(msg, entity),
+        })
+
     def download_status(self, job_id: str = "") -> dict:
         if self._downloads is None:
             raise ToolError("downloads are not configured on this server")
@@ -585,7 +634,8 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
         comes from the original file. These characters become "_": $ ` \\ " ' ; | & < > * ? { } ! : /
 
         Files are created without execute bits and never overwrite anything. Asking again for the same post
-        returns the existing jobs. Poll download_status with each job_id.
+        returns the existing jobs, and a file already at the name counts as done when Telegram's part
+        hashes match it at its start, middle and end. Poll download_status with each job_id.
         """
         return await reader.download_media(ref, message_id, name)
 
@@ -595,6 +645,24 @@ def build_server(reader: Reader, port: int = 9520) -> FastMCP:
         or all jobs still retained in memory (up to 200) when job_id is empty.
         """
         return reader.download_status(job_id)
+
+    @server.tool(annotations=read_only)
+    async def find_media(chat: str | int, sizes: list[int], before_id: int = 0) -> dict:
+        """Find posts in one channel or group whose file has one of the given sizes in bytes,
+        to tell which post a local file came from. Telegram's search does not index file
+        names, so this scans the history instead. Pass the sizes of many files at once (up
+        to 1000). Each call scans 2000 messages, newest first; pass next_before_id to go
+        further back until it is null. Confirm a candidate with check_file.
+        """
+        return await reader.find_media(chat, sizes, before_id)
+
+    @server.tool(annotations=read_only)
+    async def check_file(path: str, ref: str | int, message_id: int = 0) -> dict:
+        """Compare a file inside the download directory with a post's file. match is true
+        when the sizes agree and Telegram's SHA-256 part hashes match the file at its start,
+        middle and end. ref takes the same forms as get_message. Nothing is moved or changed.
+        """
+        return await reader.check_file(path, ref, message_id)
 
     return server
 
