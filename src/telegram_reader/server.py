@@ -480,6 +480,10 @@ class Reader:
     async def download_media(self, ref: str | int, message_id: int = 0, name: str = "") -> dict:
         if self._downloads is None:
             raise ToolError("downloads are not configured on this server")
+        # A model that garbles a rare character emits U+FFFD. The file name would
+        # keep it, and a job cannot be renamed or cancelled afterwards.
+        if "�" in name:
+            raise ToolError("name contains U+FFFD, so part of the title was lost; derive it again from the post text")
         entity, msg = await self._fetch_message(ref, message_id)
         items = await self._album(entity, msg)
         peer = utils.get_peer_id(entity)

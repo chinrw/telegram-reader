@@ -443,6 +443,14 @@ class ReaderTest(unittest.IsolatedAsyncioTestCase):
             status = reader.download_status(job["job_id"])
             self.assertEqual((status["status"], status["notice"]), ("done", tr.NOTICE))
 
+    async def test_a_name_with_a_replacement_character_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reader = tr.Reader(self.client, dl.Downloads(self.client, tmp))
+            with self.assertRaisesRegex(ToolError, "U\\+FFFD"):
+                await reader.download_media("https://t.me/chatroom/13", name="Pack �Vol.1")
+            self.assertEqual(self.client.download_calls, [])
+            self.assertEqual(reader.download_status()["jobs"], [])
+
     async def test_an_album_downloads_whole_and_takes_its_caption(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "telegram"
